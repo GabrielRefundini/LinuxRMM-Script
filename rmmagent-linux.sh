@@ -13,13 +13,6 @@ if [[ "${1:-}" == "--simple" ]]; then
     shift
 fi
 
-# insecure flag for wget (self-signed certs)
-WGET_INSECURE=""
-if [[ "${WGET_INSECURE_FLAG:-}" == "true" ]]; then
-    WGET_INSECURE="--no-check-certificate"
-fi  
-
-
 # color codes
 RED="\e[31m"
 GREEN="\e[32m"
@@ -51,24 +44,26 @@ function err_echo() {
     fi
 }
 
-#--- cleanup trap --------------------------------------------------------------
-cleanup() {
-    info_echo "Cleaning up temporary files..."
-    rm -rf /tmp/temp_rmmagent \
-           /tmp/rmmagent-master \
-           /tmp/meshagent \
-           /tmp/meshagent.msh \
-           /tmp/golang.tar.gz \
-           ./go 2>/dev/null || true
-    ok_echo "Temporary files cleaned."
-}
-trap cleanup EXIT
-
 #--- safety: require root -------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Please run as root (e.g. sudo $0 ...)"
     exit 1
 fi
+
+#--- staging directory ----------------------------------------------------------
+# Private root-owned directory instead of fixed /tmp paths: a world-writable /tmp
+# lets a local user swap a file between verification and use, or pre-plant a
+# symlink for wget to follow.
+STAGING="$(mktemp -d /tmp/rmmagent-install.XXXXXXXX)"
+chmod 700 "$STAGING"
+
+#--- cleanup trap --------------------------------------------------------------
+cleanup() {
+    info_echo "Cleaning up temporary files..."
+    rm -rf "$STAGING" ./go 2>/dev/null || true
+    ok_echo "Temporary files cleaned."
+}
+trap cleanup EXIT
 
 #--- usage / guards -------------------------------------------------------------
 if [[ -z "${1:-}" ]]; then
@@ -108,6 +103,13 @@ if [[ "$1" != "install" && "$1" != "update" && "$1" != "uninstall" ]]; then
     exit 1
 fi
 
+# Checked here, before anything touches the system: aborting later would leave an
+# orphaned MeshCentral registration behind.
+if [[ "$1" != "uninstall" ]] && ! command -v git >/dev/null 2>&1; then
+    echo "git not found. It is required to fetch the pinned agent version."
+    exit 1
+fi
+
 #--- arch detection -------------------------------------------------------------
 
 function detect_arch() {
@@ -142,28 +144,60 @@ go_url_x86="https://go.dev/dl/go${go_version}.linux-386.tar.gz"
 go_url_arm64="https://go.dev/dl/go${go_version}.linux-arm64.tar.gz"
 go_url_armv6="https://go.dev/dl/go${go_version}.linux-armv6l.tar.gz"
 
+# Official sha256 sums from https://go.dev/dl/?mode=json (update when bumping go_version)
+go_sha_amd64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+go_sha_x86="88c162b204e6eefcc32499453b492e80209f4a4c78c33092636901c540fb0d05"
+go_sha_arm64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+go_sha_armv6="6dae9edab81c13bccf962dec15f1fd2ec26c14a6821b4d2c92dab4130c289d7a"
+
+# Pinned agent version. The commit is the real integrity anchor: a git SHA covers
+# the whole tree, so a tag rewritten upstream is caught here.
+# Must match LATEST_AGENT_VER of the TRMM server (v1.5.2 expects 2.11.0).
+# Override per-run with AGENT_TAG/AGENT_COMMIT (both required together).
+agent_tag="${AGENT_TAG:-v2.11.0}"
+agent_commit="${AGENT_COMMIT:-e6b61ba540af2df9d13247f96538397daa3c4f1f}"
+
+if [[ -n "${AGENT_TAG:-}${AGENT_COMMIT:-}" && ( -z "${AGENT_TAG:-}" || -z "${AGENT_COMMIT:-}" ) ]]; then
+    echo "AGENT_TAG and AGENT_COMMIT must be set together."
+    exit 1
+fi
+
 mesh_amd64="&installflags=0&meshinstall=6"
 mesh_arm6l="&installflags=0&meshinstall=25"
 mesh_arm64="&installflags=0&meshinstall=26"
 
 #--- helpers -------------------------------------------------------------------
+function verify_sha256() {
+    local file="$1" expected="$2" actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        err_echo "Invalid checksum for $file"
+        err_echo "  expected: $expected"
+        err_echo "  got:      $actual"
+        exit 1
+    fi
+    ok_echo "Checksum verified: $(basename "$file")"
+}
+
 function go_install() {
     system=$(detect_arch)
     if ! command -v go >/dev/null 2>&1; then
         info_echo "Installing Go $go_version for $system..."
         case "$system" in
-            amd64) url="$go_url_amd64" ;;
-            x86)   url="$go_url_x86" ;;
-            arm64) url="$go_url_arm64" ;;
-            armv6) url="$go_url_armv6" ;;
+            amd64) url="$go_url_amd64"; sha="$go_sha_amd64" ;;
+            x86)   url="$go_url_x86";   sha="$go_sha_x86" ;;
+            arm64) url="$go_url_arm64"; sha="$go_sha_arm64" ;;
+            armv6) url="$go_url_armv6"; sha="$go_sha_armv6" ;;
+            *) err_echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
         esac
         if $SIMPLE; then
-            wget -q -O /tmp/golang.tar.gz "$url" 2>/dev/null
+            wget -q -O "$STAGING/golang.tar.gz" "$url" 2>/dev/null
         else
-            wget -q --show-progress -O /tmp/golang.tar.gz "$url"
+            wget -q --show-progress -O "$STAGING/golang.tar.gz" "$url"
         fi
+        verify_sha256 "$STAGING/golang.tar.gz" "$sha"
         rm -rf /usr/local/go/
-        tar -xzf /tmp/golang.tar.gz -C /usr/local/ 2>/dev/null
+        tar -xzf "$STAGING/golang.tar.gz" -C /usr/local/ 2>/dev/null
 
         export PATH=/usr/local/go/bin:$PATH
         if ! grep -q "/usr/local/go/bin" /etc/profile; then
@@ -175,38 +209,49 @@ function go_install() {
 
 function update_agent() {
     systemctl stop tacticalagent
-    cp "/tmp/temp_rmmagent" /usr/local/bin/rmmagent
-    rm "/tmp/temp_rmmagent"
+    install -m 0755 "$STAGING/temp_rmmagent" /usr/local/bin/rmmagent
     systemctl start tacticalagent
 }
 
+function agent_fetch() {
+    info_echo "Fetching agent $agent_tag ($agent_commit)..."
+    rm -rf "$STAGING/rmmagent-src"
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "$agent_tag" \
+        https://github.com/amidaware/rmmagent.git "$STAGING/rmmagent-src"
+
+    local actual
+    actual=$(git -C "$STAGING/rmmagent-src" rev-parse HEAD)
+    if [[ "$actual" != "$agent_commit" ]]; then
+        err_echo "Agent commit mismatch - the tag may have been rewritten upstream."
+        err_echo "  expected: $agent_commit"
+        err_echo "  got:      $actual"
+        exit 1
+    fi
+    ok_echo "Agent $agent_tag verified at commit $agent_commit"
+}
+
 function agent_compile() {
+    agent_fetch
     info_echo "Compiling Tactical RMM agent for $system..."
-    if $SIMPLE; then
-        wget -q -O /tmp/rmmagent.tar.gz "https://github.com/amidaware/rmmagent/archive/refs/heads/master.tar.gz" 2>/dev/null
-    else
-        wget -q --show-progress -O /tmp/rmmagent.tar.gz "https://github.com/amidaware/rmmagent/archive/refs/heads/master.tar.gz"
-    fi
-    tar -xf /tmp/rmmagent.tar.gz -C /tmp/ 2>/dev/null
-    cd /tmp/rmmagent-master
+    cd "$STAGING/rmmagent-src"
+
+    case "$system" in
+        amd64) goarch="amd64" ;;
+        x86)   goarch="386" ;;
+        arm64) goarch="arm64" ;;
+        armv6) goarch="arm" ;;
+        *) err_echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+    esac
 
     if $SIMPLE; then
-        case "$system" in
-            amd64) env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o /tmp/temp_rmmagent >/dev/null 2>&1 ;;
-            x86)   env CGO_ENABLED=0 GOOS=linux GOARCH=386   go build -ldflags "-s -w" -o /tmp/temp_rmmagent >/dev/null 2>&1 ;;
-            arm64) env CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o /tmp/temp_rmmagent >/dev/null 2>&1 ;;
-            armv6) env CGO_ENABLED=0 GOOS=linux GOARCH=arm   go build -ldflags "-s -w" -o /tmp/temp_rmmagent >/dev/null 2>&1 ;;
-        esac
+        env CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+            go build -ldflags "-s -w" -o "$STAGING/temp_rmmagent" >/dev/null 2>&1
     else
-        case "$system" in
-            amd64) env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o /tmp/temp_rmmagent ;;
-            x86)   env CGO_ENABLED=0 GOOS=linux GOARCH=386   go build -ldflags "-s -w" -o /tmp/temp_rmmagent ;;
-            arm64) env CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o /tmp/temp_rmmagent ;;
-            armv6) env CGO_ENABLED=0 GOOS=linux GOARCH=arm   go build -ldflags "-s -w" -o /tmp/temp_rmmagent ;;
-        esac
+        env CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+            go build -ldflags "-s -w" -o "$STAGING/temp_rmmagent"
     fi
 
-    cd /tmp
+    cd "$STAGING"
     ok_echo "Tactical RMM agent compiled."
 }
 
@@ -220,7 +265,7 @@ function install_agent() {
         info_echo "Old /etc/tacticalagent removed."
     fi
 
-    install -m 0755 /tmp/temp_rmmagent /usr/local/bin/rmmagent
+    install -m 0755 "$STAGING/temp_rmmagent" /usr/local/bin/rmmagent
 
     if $SIMPLE; then
         echo
@@ -281,16 +326,16 @@ function install_mesh() {
 
     full_mesh_url="${mesh_url}${mesh_param}"
     if $SIMPLE; then
-        wget -q -O /tmp/meshagent "$full_mesh_url" 2>/dev/null
+        wget -q -O "$STAGING/meshagent" "$full_mesh_url" 2>/dev/null
     else
-        wget -q --show-progress -O /tmp/meshagent "$full_mesh_url"
+        wget -q --show-progress -O "$STAGING/meshagent" "$full_mesh_url"
     fi
-    chmod +x /tmp/meshagent
+    chmod +x "$STAGING/meshagent"
     mkdir -p /opt/tacticalmesh
     if $SIMPLE; then
-        /tmp/meshagent -install --installPath="/opt/tacticalmesh" >/dev/null 2>&1
+        "$STAGING/meshagent" -install --installPath="/opt/tacticalmesh" >/dev/null 2>&1
     else
-        /tmp/meshagent -install --installPath="/opt/tacticalmesh"
+        "$STAGING/meshagent" -install --installPath="/opt/tacticalmesh"
     fi
     ok_echo "Mesh agent installed."
 }
@@ -315,18 +360,18 @@ function uninstall_mesh() {
     fi
 
     if $SIMPLE; then
-        wget "https://${mesh_fqdn}/meshagents?script=1" -O /tmp/meshinstall.sh 2>/dev/null \
-            || wget "https://${mesh_fqdn}/meshagents?script=1" --no-proxy -O /tmp/meshinstall.sh 2>/dev/null
+        wget "https://${mesh_fqdn}/meshagents?script=1" -O "$STAGING/meshinstall.sh" 2>/dev/null \
+            || wget "https://${mesh_fqdn}/meshagents?script=1" --no-proxy -O "$STAGING/meshinstall.sh" 2>/dev/null
     else
-        wget "https://${mesh_fqdn}/meshagents?script=1" -O /tmp/meshinstall.sh \
-            || wget "https://${mesh_fqdn}/meshagents?script=1" --no-proxy -O /tmp/meshinstall.sh
+        wget "https://${mesh_fqdn}/meshagents?script=1" -O "$STAGING/meshinstall.sh" \
+            || wget "https://${mesh_fqdn}/meshagents?script=1" --no-proxy -O "$STAGING/meshinstall.sh"
     fi
 
-    chmod 755 /tmp/meshinstall.sh
+    chmod 755 "$STAGING/meshinstall.sh"
     if $SIMPLE; then
-        /tmp/meshinstall.sh uninstall "https://${mesh_fqdn}" "$mesh_id" >/dev/null 2>&1 || true
+        "$STAGING/meshinstall.sh" uninstall "https://${mesh_fqdn}" "$mesh_id" >/dev/null 2>&1 || true
     else
-        /tmp/meshinstall.sh uninstall "https://${mesh_fqdn}" "$mesh_id" || true
+        "$STAGING/meshinstall.sh" uninstall "https://${mesh_fqdn}" "$mesh_id" || true
     fi
     ok_echo "Mesh agent uninstall attempted."
 }
