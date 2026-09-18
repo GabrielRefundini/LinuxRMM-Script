@@ -231,3 +231,38 @@ This project is based on [Netvolt’s LinuxRMM-Script](https://github.com/netvol
 ✨ **Professional, robust, and multi-platform ready — the easiest way to manage TacticalRMM agents on Linux.**
 
 
+
+---
+
+## Credenziale fork — changes from upstream
+
+This fork is pinned on purpose. Differences from `Nerdy-Technician/LinuxRMM-Script`:
+
+* **Agent version is pinned**, not `master`. `agent_tag` / `agent_commit` at the top of
+  the script select the version, and the build aborts if the tag no longer resolves to
+  the expected commit (i.e. it was rewritten upstream).
+* **Go tarball is checksum-verified** against the official sums from
+  `https://go.dev/dl/?mode=json`, before the existing Go install is removed.
+* **Work happens in a private `mktemp -d` staging dir**, not fixed paths in `/tmp`.
+* **`git` is required** and checked up front, before Go or the Mesh agent are installed.
+* Removed the dead `WGET_INSECURE` block.
+
+### Bumping the agent version
+
+The pin must match `LATEST_AGENT_VER` of the TRMM server (server v1.5.2 expects 2.11.0):
+
+```bash
+# server version: panel header, or LATEST_AGENT_VER in the server's settings.py
+curl -s https://api.github.com/repos/amidaware/rmmagent/git/ref/tags/vX.Y.Z \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["object"]["sha"])'
+```
+
+Update `agent_tag` and `agent_commit` and commit the change, so every host installs the
+reviewed version. For a one-off test without editing the script, both can be overridden
+together:
+
+```bash
+AGENT_TAG=vX.Y.Z AGENT_COMMIT=<full sha> ./rmmagent-linux.sh update
+```
+
+`update` rebuilds the pinned version — it does not follow upstream releases by design.
